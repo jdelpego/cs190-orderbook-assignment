@@ -13,25 +13,27 @@ interface IERC20 {
     function allowance(address owner, address spender) external view returns (uint256);
 }
 
-/// @title Orderbook (template)
-/// @notice Skeleton to complete. The constructor, immutable
-///         token wiring, and the two trivial getters are already done —
-///         everything else reverts with `"NotImplemented"`.
-///
-///         You are free to add additional state, structs, errors, and
-///         helper functions. The only hard constraints are:
-///         (1) keep the `IOrderbook` ABI exactly as declared in the
-///             interface (the grading harness depends on it), and
-///         (2) keep `baseToken`/`quoteToken` as immutables set in the
-///             constructor.
+/// @title Orderbook
+/// @notice Simple on-chain limit orderbook trading a base ERC20 against a
+///         quote ERC20. Limit orders escrow funds in the contract (quote for
+///         bids, base for asks) and rest until a market order matches them.
 contract Orderbook is IOrderbook {
     IERC20 public immutable baseToken;
     IERC20 public immutable quoteToken;
 
-    /// @dev Suggested events. These are a starting point — your
-    ///      implementation may emit a different set, rename them, or omit
-    ///      events entirely. Nothing in the grading harness depends on
-    ///      these signatures.
+    uint256 private constant ONE = 1e18;
+
+    struct Order {
+        uint256 id;
+        address maker;
+        uint256 price; // quote wei per one whole (1e18 wei) base token
+        uint256 amount; // remaining base wei
+    }
+
+    Order[] private bids;
+    Order[] private asks;
+    uint256 private nextOrderId = 1;
+
     event OrderPlaced(
         uint256 indexed orderId,
         address indexed maker,
@@ -64,26 +66,112 @@ contract Orderbook is IOrderbook {
     }
 
     function placeLimitOrder(Side side, uint256 price, uint256 amount) external returns (uint256) {
-        revert("NotImplemented");
+        require(price > 0, "price=0");
+        require(amount > 0, "amount=0");
+
+        uint256 orderId = nextOrderId++;
+        if (side == Side.BUY) {
+            // Lock the quote needed to pay for `amount` base at `price`.
+            require(quoteToken.transferFrom(msg.sender, address(this), _quoteAmount(amount, price)), "quote transfer failed");
+            bids.push(Order(orderId, msg.sender, price, amount));
+        } else {
+            // Lock the base being sold.
+            require(baseToken.transferFrom(msg.sender, address(this), amount), "base transfer failed");
+            asks.push(Order(orderId, msg.sender, price, amount));
+        }
+
+        emit OrderPlaced(orderId, msg.sender, side, price, amount);
+        return orderId;
     }
 
     function placeMarketOrder(Side side, uint256 amount) external {
-        revert("NotImplemented");
+        uint256 remaining = amount;
+        if (side == Side.BUY) {
+            // Walk the asks from lowest price up; fill whatever is available.
+            while (remaining > 0 && asks.length > 0) {
+                uint256 i = _bestAskIndex();
+                Order storage o = asks[i];
+                uint256 fill = remaining < o.amount ? remaining : o.amount;
+
+                require(quoteToken.transferFrom(msg.sender, o.maker, _quoteAmount(fill, o.price)), "quote transfer failed");
+                require(baseToken.transfer(msg.sender, fill), "base transfer failed");
+
+                emit OrderFilled(o.id, msg.sender, fill, o.price);
+                o.amount -= fill;
+                remaining -= fill;
+                if (o.amount == 0) _removeOrder(asks, i);
+            }
+        } else {
+            // Walk the bids from highest price down; fill whatever is available.
+            while (remaining > 0 && bids.length > 0) {
+                uint256 i = _bestBidIndex();
+                Order storage o = bids[i];
+                uint256 fill = remaining < o.amount ? remaining : o.amount;
+
+                require(baseToken.transferFrom(msg.sender, o.maker, fill), "base transfer failed");
+                require(quoteToken.transfer(msg.sender, _quoteAmount(fill, o.price)), "quote transfer failed");
+
+                emit OrderFilled(o.id, msg.sender, fill, o.price);
+                o.amount -= fill;
+                remaining -= fill;
+                if (o.amount == 0) _removeOrder(bids, i);
+            }
+        }
     }
 
     function clear() external {
-        revert("NotImplemented");
+        for (uint256 i = 0; i < bids.length; i++) {
+            require(quoteToken.transfer(bids[i].maker, _quoteAmount(bids[i].amount, bids[i].price)), "quote refund failed");
+        }
+        for (uint256 i = 0; i < asks.length; i++) {
+            require(baseToken.transfer(asks[i].maker, asks[i].amount), "base refund failed");
+        }
+        delete bids;
+        delete asks;
+        emit OrderCleared();
     }
 
     function getBidsCount() external view returns (uint256) {
-        revert("NotImplemented");
+        return bids.length;
     }
 
     function getAsksCount() external view returns (uint256) {
-        revert("NotImplemented");
+        return asks.length;
     }
 
     function getMidPrice() external view returns (uint256) {
-        revert("NotImplemented");
+        require(bids.length > 0, "no bids");
+        require(asks.length > 0, "no asks");
+        return (bids[_bestBidIndex()].price + asks[_bestAskIndex()].price) / 2;
+    }
+
+    /// @dev Quote wei owed for `amount` base wei at `price` quote per 1e18 base wei.
+    function _quoteAmount(uint256 amount, uint256 price) private pure returns (uint256) {
+        return amount * price / ONE;
+    }
+
+    /// @dev Index of the lowest-priced ask; ties broken by lowest order id.
+    function _bestAskIndex() private view returns (uint256 best) {
+        for (uint256 i = 1; i < asks.length; i++) {
+            if (asks[i].price < asks[best].price || (asks[i].price == asks[best].price && asks[i].id < asks[best].id)) {
+                best = i;
+            }
+        }
+    }
+
+    /// @dev Index of the highest-priced bid; ties broken by lowest order id.
+    function _bestBidIndex() private view returns (uint256 best) {
+        for (uint256 i = 1; i < bids.length; i++) {
+            if (bids[i].price > bids[best].price || (bids[i].price == bids[best].price && bids[i].id < bids[best].id)) {
+                best = i;
+            }
+        }
+    }
+
+    /// @dev Swap-and-pop removal; order within the array does not matter
+    ///      because matching always scans for the best price.
+    function _removeOrder(Order[] storage orders, uint256 i) private {
+        orders[i] = orders[orders.length - 1];
+        orders.pop();
     }
 }
